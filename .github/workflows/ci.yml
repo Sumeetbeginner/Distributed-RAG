@@ -1,0 +1,28 @@
+name: Verify DistributedRAG
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r requirements-dev.lock
+      - run: ruff check app tests scripts
+      - run: python -m pytest -q
+  distributed:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo sysctl -w vm.max_map_count=262144
+      - run: docker compose up --build -d api
+      - run: docker compose --profile test run --rm integration
+      - if: always()
+        run: docker compose logs --tail=100 && docker compose down -v

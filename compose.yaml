@@ -1,0 +1,122 @@
+# Development cluster only. Database/search ports are not exposed to the host.
+x-app: &app
+  build: .
+  env_file:
+    - path: .env
+      required: false
+  environment: &environment
+    DATABASE_URL: postgresql+psycopg://drag:local-dev-only@postgres:5432/drag
+    SEARCH_BACKEND: opensearch
+    OPENSEARCH_URLS: http://search-1:9200,http://search-2:9200,http://search-3:9200
+    REDIS_URL: redis://redis:6379/0
+    INDEX_SHARDS: 4
+    INDEX_REPLICAS: 1
+  restart: unless-stopped
+
+x-search: &search
+  image: opensearchproject/opensearch:2.19.1
+  environment: &search-env
+    cluster.name: distributedrag
+    discovery.seed_hosts: search-1,search-2,search-3
+    cluster.initial_cluster_manager_nodes: search-1,search-2,search-3
+    bootstrap.memory_lock: "true"
+    OPENSEARCH_JAVA_OPTS: -Xms512m -Xmx512m
+    DISABLE_INSTALL_DEMO_CONFIG: "true"
+    DISABLE_SECURITY_PLUGIN: "true"
+  ulimits:
+    memlock:
+      soft: -1
+      hard: -1
+    nofile:
+      soft: 65536
+      hard: 65536
+  healthcheck:
+    test: ["CMD-SHELL", "curl -fsS 'http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=5s' || exit 1"]
+    interval: 10s
+    timeout: 10s
+    retries: 40
+  restart: unless-stopped
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: drag
+      POSTGRES_PASSWORD: local-dev-only
+      POSTGRES_DB: drag
+    volumes: ["postgres-data:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U drag -d drag"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--maxmemory", "128mb", "--maxmemory-policy", "allkeys-lru"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+  search-1:
+    <<: *search
+    environment:
+      <<: *search-env
+      node.name: search-1
+    volumes: ["search-1-data:/usr/share/opensearch/data"]
+  search-2:
+    <<: *search
+    environment:
+      <<: *search-env
+      node.name: search-2
+    volumes: ["search-2-data:/usr/share/opensearch/data"]
+  search-3:
+    <<: *search
+    environment:
+      <<: *search-env
+      node.name: search-3
+    volumes: ["search-3-data:/usr/share/opensearch/data"]
+  init:
+    <<: *app
+    command: ["python", "-m", "app.cli", "init"]
+    restart: "no"
+    depends_on:
+      postgres: {condition: service_healthy}
+      search-1: {condition: service_healthy}
+      search-2: {condition: service_healthy}
+      search-3: {condition: service_healthy}
+  api:
+    <<: *app
+    ports: ["127.0.0.1:8000:8000"]
+    depends_on:
+      init: {condition: service_completed_successfully}
+      redis: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/ready')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+  worker:
+    <<: *app
+    command: ["python", "-m", "app.worker"]
+    stop_grace_period: 120s
+    depends_on:
+      init: {condition: service_completed_successfully}
+  integration:
+    <<: *app
+    profiles: ["test"]
+    command: ["sh", "-c", "pip install --user pytest && python -m pytest -q tests/test_distributed.py"]
+    volumes: ["./tests:/app/tests:ro"]
+    environment:
+      <<: *environment
+      RUN_DISTRIBUTED_TESTS: "1"
+    restart: "no"
+    depends_on:
+      api: {condition: service_healthy}
+volumes:
+  postgres-data:
+  search-1-data:
+  search-2-data:
+  search-3-data:
